@@ -1,38 +1,28 @@
-# build.yaml — CI for duitku.
+# build.yaml — reusable build + test workflow for duitku.
 #
-# Runs on every push/PR to main and on version tags. The job graph is:
+# Called by release.yaml (and any other workflow that wants to
+# validate the repo without publishing). Pure validation: pytest +
+# a no-push Docker build to catch Dockerfile regressions. No GHCR
+# writes, no git tag side-effects.
 #
-#   test            ─┐
-#                    ├── release (only on push to main + tag pushes)
-#   docker-build    ─┘
-#
-# - `test` runs pytest on cp3.13 (the deployment target).
-# - `docker-build` does a no-push build to catch Dockerfile regressions
-#   without burning GHCR pulls.
-# - `release` is invoked via `workflow_call` from this file; it lives
-#   in release.yaml so it can also be run on its own via
-#   workflow_dispatch when a re-publish is needed without a code
-#   change. The `permissions:` block here is what grants the called
-#   workflow access to GHCR.
-#
-# We do not publish from PRs (would expose the registry to forks). We
-# also do not publish from feature branches; main + tags only.
+# Kept as a separate file (rather than inlined into release.yaml)
+# so that:
+#   - the test/docker-build outputs surface as their own checks on
+#     the PR status page, distinct from the release publish step;
+#   - a future workflow (e.g. a nightly schedule, a manual
+#     debug-run, a worker-deploy.yaml) can re-use the same
+#     validation entrypoint without copy-paste.
 
 name: build
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
-
-# Cancel in-progress runs for the same ref when a new commit lands.
-# Workflow runs on tags are kept (release builds shouldn't be cancelled).
-concurrency:
-  group: build-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  workflow_call:
+    inputs:
+      ref:
+        description: "git ref to check out (default: caller's ref)"
+        type: string
+        required: false
+        default: ''
 
 jobs:
   test:
@@ -40,6 +30,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - uses: actions/setup-python@v5
         with:
@@ -50,7 +42,8 @@ jobs:
       - name: install duitku + dev + parsers extras
         run: |
           python -m pip install --upgrade pip
-          # [parsers] is needed because the parser tests import pikepdf/pdfplumber lazily.
+          # [parsers] is needed because the parser tests import
+          # pikepdf/pdfplumber lazily via pdfutil.open_pdf.
           pip install '.[dev,parsers]'
 
       - name: pytest
@@ -61,6 +54,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - uses: docker/setup-buildx-action@v3
 
@@ -74,18 +69,3 @@ jobs:
           platforms: linux/amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  release:
-    name: release
-    needs: [test, docker-build]
-    # Publish on:
-    #   - push to main (rolling :main + :latest + :<pyproject-version>)
-    #   - tag push v* (semver-tagged release, also :latest)
-    # PRs and feature branches build-and-test only.
-    if: >-
-      github.event_name == 'push' &&
-      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-    uses: ./.github/workflows/release.yaml
-    permissions:
-      contents: read
-      packages: write
