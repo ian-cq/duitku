@@ -1,15 +1,15 @@
 # release.yaml — main orchestrator: validate via build.yaml, then publish to GHCR.
 #
-# This is the trigger-driven entrypoint. On any push/PR/dispatch it
-# calls build.yaml (which runs tests + a no-push Docker build), and
-# on pushes to main + v* tag pushes it additionally publishes the
-# image to ghcr.io/<owner>/duitku.
+# Trigger: push to main only. PRs run build.yaml directly (see that
+# file's own triggers); they do not enter this workflow. Tag-based and
+# manual (workflow_dispatch) triggers are intentionally removed — the
+# only way to publish an image is to land a commit on main.
 #
 # Job graph:
 #
 #   build (reusable: ./.github/workflows/build.yaml)
 #     │
-#     └── publish   (only on push to main or v* tag)
+#     └── publish   (push image to ghcr.io/<owner>/duitku)
 #
 # Auth is the workflow-issued GITHUB_TOKEN with packages: write — no
 # PAT required. The first publish creates the package under the repo;
@@ -26,30 +26,17 @@ name: release
 on:
   push:
     branches: [main]
-    tags: ['v*']
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: "git ref to build (branch, tag, or sha)"
-        type: string
-        required: false
-        default: ''
 
-# Cancel in-progress runs for the same ref when a new commit lands,
-# but never cancel a tag-driven release run (could leave GHCR in a
-# half-published state on retry).
+# Serialize main-push publishes. Never cancel an in-flight publish —
+# half-pushed image tags on GHCR are worse than a queued run.
 concurrency:
-  group: release-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  group: release-${{ github.workflow }}
+  cancel-in-progress: false
 
 jobs:
   build:
     name: build
     uses: ./.github/workflows/build.yaml
-    with:
-      ref: ${{ inputs.ref || '' }}
     # build.yaml needs no special permissions; default token is fine.
 
   publish:
@@ -59,19 +46,8 @@ jobs:
     permissions:
       contents: read
       packages: write
-    # Publish on:
-    #   - push to main (rolling :main + :latest + :<pyproject-version>)
-    #   - tag push v* (semver-tagged release, also :latest)
-    #   - manual workflow_dispatch (operator decides what to publish)
-    # PRs and feature branches validate via `build` only; no publish.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' &&
-       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.ref }}
 
       - name: read version from pyproject.toml
         id: version
@@ -100,34 +76,15 @@ jobs:
           version="${{ steps.version.outputs.version }}"
           short_sha="${GITHUB_SHA::7}"
 
-          tags=()
-          tags+=("${image}:${version}")
-          tags+=("${image}:sha-${short_sha}")
-
-          ref="${GITHUB_REF}"
-          if [ "$ref" = "refs/heads/main" ]; then
-            tags+=("${image}:main")
-            tags+=("${image}:latest")
-          elif [[ "$ref" == refs/tags/v* ]]; then
-            tag_ver="${ref#refs/tags/}"        # vX.Y.Z
-            stripped="${tag_ver#v}"            # X.Y.Z
-            major="${stripped%%.*}"
-            minor_rest="${stripped#*.}"
-            minor="${minor_rest%%.*}"
-            tags+=("${image}:${tag_ver}")
-            tags+=("${image}:v${major}.${minor}")
-            tags+=("${image}:v${major}")
-            tags+=("${image}:latest")
-            # Sanity check: a vX.Y.Z tag should match the pyproject version.
-            if [ "$stripped" != "$version" ]; then
-              echo "::warning::git tag $tag_ver does not match pyproject version $version"
-            fi
-          fi
-
-          # Comma-separated list for docker/build-push-action.
-          ( IFS=','; echo "tags=${tags[*]}" ) >> "$GITHUB_OUTPUT"
+          # Only main-push reaches this job, so the tag set is fixed:
+          #   :<pyproject-version>  reproducible pin
+          #   :sha-<short>          exact commit
+          #   :main                 rolling main branch
+          #   :latest               rolling latest
+          tags="${image}:${version},${image}:sha-${short_sha},${image}:main,${image}:latest"
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
           printf "tags:\n"
-          printf '  %s\n' "${tags[@]}"
+          printf '  %s\n' ${tags//,/ }
 
       - uses: docker/setup-buildx-action@v3
 

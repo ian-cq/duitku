@@ -16,6 +16,10 @@
 name: build
 
 on:
+  # Trigger directly on PRs against main so build status appears on the
+  # PR checks page without needing release.yaml to fan out to forks.
+  pull_request:
+    branches: [main]
   workflow_call:
     inputs:
       ref:
