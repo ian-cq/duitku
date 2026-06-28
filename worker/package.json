@@ -1,0 +1,20 @@
+{
+  "name": "duitku-email-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Email Worker that forwards bank-statement attachments to duitku-webhook.",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "tail": "wrangler tail",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240620.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^3.62.0"
+  },
+  "dependencies": {
+    "postal-mime": "^2.2.7"
+  }
+}
