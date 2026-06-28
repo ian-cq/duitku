@@ -1,0 +1,14 @@
+# /etc/duitku/accounts.yaml
+#
+# Map bank-side account_id -> Firefly asset-account name.
+# The account_id format is whatever the parser surfaces; see parser
+# docstrings for the exact shape per bank. accounts.yaml entries are
+# required - if a parsed statement's account_id is not listed here,
+# the file fails the import, no silent fallback.
+
+maybank:
+  # "1234": "Maybank Savings ****1234"
+uob:
+  # "5678": "UOB One ****5678"
+ryt:
+  # "9012": "Ryt Bank ****9012"
