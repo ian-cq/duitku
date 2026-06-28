@@ -39,10 +39,11 @@ COPY pyproject.toml ./
 COPY src/ ./src/
 COPY README.md LICENSE ./
 
-# Install duitku itself (which installs its declared runtime deps).
-# Parsers are NOT installed in the webhook image — the eventual
-# sweep/parse worker will install duitku[parsers] in its own image.
-RUN pip install --no-cache-dir .
+# Install duitku + parsers extra. Same image runs `serve` (webhook)
+# and `sweep` (which needs pikepdf + pdfplumber to read PDFs). One
+# image is simpler than two; pikepdf+pdfplumber add ~70 MB and ship
+# manylinux wheels for cp313 so no extra apt deps are needed.
+RUN pip install --no-cache-dir '.[parsers]'
 
 
 FROM python:${PYTHON_VERSION}-slim AS runtime

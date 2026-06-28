@@ -18,6 +18,11 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+
+# Worker / Node
+/worker/node_modules/
+/worker/.wrangler/
+/worker/dist/
 *.swp
 
 # Local secrets and data

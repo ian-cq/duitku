@@ -112,21 +112,44 @@ def sweep(
         "--accounts-file",
         help="YAML map from bank-account fingerprint to Firefly account id",
     ),
+    only_bank: str = typer.Option(
+        "", "--bank", help="restrict sweep to one bank slug (default: all)"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="discover files but don't parse/emit/move"
+    ),
 ) -> None:
     """Scan the landing directory and push new statements to Firefly III.
 
-    Stub: phase-1 work will wire parsers + dedup + Firefly emitter.
-    The ``--passwords-file`` and ``--accounts-file`` flags are accepted
-    now so the deployment manifest stays stable.
+    Files move from ``<landing>/<bank>/inbox/`` to ``processed/`` on
+    success or ``failed/<file>.err`` on hard failure. Re-runs are
+    safe — Firefly's ``error_if_duplicate_hash=true`` plus our
+    ``external_id`` make duplicates a no-op success.
     """
     _setup_logging()
     log = logging.getLogger("duitku.sweep")
+
+    from duitku.sweep import run_sweep
+
+    try:
+        results = run_sweep(
+            landing_dir,
+            passwords_file=passwords_file,
+            accounts_file=accounts_file,
+            only_bank=only_bank or None,
+            dry_run=dry_run,
+        )
+    except Exception:
+        log.exception("sweep aborted before processing")
+        raise typer.Exit(code=2)
+
+    ok = sum(1 for r in results if r.outcome == "ok")
+    failed = sum(1 for r in results if r.outcome == "failed")
     log.info(
-        "sweep stub: no parsers wired yet (landing=%s passwords=%s accounts=%s)",
-        landing_dir,
-        passwords_file,
-        accounts_file,
+        "sweep complete",
+        extra={"processed": ok, "failed": failed, "total": len(results)},
     )
+    raise typer.Exit(code=1 if failed else 0)
 
 
 @app.command()
@@ -173,30 +196,107 @@ def prune(
 def parse_cmd(
     bank: str = typer.Option(..., "--bank", help="bank slug, e.g. maybank"),
     paths: list[Path] = typer.Argument(..., help="statement files"),
+    passwords_file: Path = typer.Option(
+        Path(os.environ.get("DUITKU_PASSWORDS_FILE", "/etc/duitku/passwords.toml")),
+        "--passwords-file",
+        help="TOML file with PDF passwords to try in order",
+    ),
 ) -> None:
-    """Parse a statement and emit canonical Transaction JSON to stdout.
+    """Parse statements and emit canonical Transaction JSON to stdout.
 
-    Stub: phase-1 wires the per-bank parsers.
+    Useful for offline debugging / fixture inspection. Does not talk to
+    Firefly. One JSON document per file, newline-delimited (NDJSON).
     """
     _setup_logging()
     log = logging.getLogger("duitku.parse")
-    log.warning(
-        "parse stub: no parser wired for %s yet (%d file(s))",
-        bank,
-        len(paths),
-    )
-    raise typer.Exit(code=1)
+
+    import json as _json
+    from dataclasses import asdict
+
+    from duitku import parsers
+    from duitku.normalise import normalise
+    from duitku.sweep import load_passwords
+
+    passwords = load_passwords(passwords_file)
+    exit_code = 0
+    for p in paths:
+        try:
+            statement = parsers.parse(bank, p, passwords=passwords)
+        except Exception:
+            log.exception("parse failed", extra={"file": str(p)})
+            exit_code = 1
+            continue
+        txns = normalise(statement)
+        doc = {
+            "bank": statement.bank,
+            "account_id": statement.account_id,
+            "currency": statement.currency,
+            "period_start": statement.period_start.isoformat() if statement.period_start else None,
+            "period_end": statement.period_end.isoformat() if statement.period_end else None,
+            "opening_balance": str(statement.opening_balance) if statement.opening_balance is not None else None,
+            "closing_balance": str(statement.closing_balance) if statement.closing_balance is not None else None,
+            "layout_version": statement.layout_version,
+            "transactions": [
+                {
+                    **asdict(t),
+                    "date": t.date.isoformat(),
+                    "amount": str(t.amount),
+                    "foreign_amount": str(t.foreign_amount) if t.foreign_amount is not None else None,
+                }
+                for t in txns
+            ],
+        }
+        typer.echo(_json.dumps(doc, default=str))
+    raise typer.Exit(code=exit_code)
 
 
 @app.command(name="import")
 def import_cmd(
-    paths: list[Path] = typer.Argument(..., help="canonical Transaction JSON files"),
+    bank: str = typer.Option(..., "--bank", help="bank slug, e.g. maybank"),
+    paths: list[Path] = typer.Argument(..., help="statement files (PDF)"),
+    passwords_file: Path = typer.Option(
+        Path(os.environ.get("DUITKU_PASSWORDS_FILE", "/etc/duitku/passwords.toml")),
+        "--passwords-file",
+    ),
+    accounts_file: Path = typer.Option(
+        Path(os.environ.get("DUITKU_ACCOUNTS_FILE", "/etc/duitku/accounts.yaml")),
+        "--accounts-file",
+    ),
 ) -> None:
-    """Push canonical Transaction JSON into Firefly III.
+    """One-shot: parse + reconcile + push to Firefly. No filesystem state machine.
 
-    Stub: phase-2 wires the Firefly emitter.
+    Sibling of ``sweep`` for manually re-importing a specific file
+    without going through the inbox/processed/failed lifecycle. Files
+    are not moved.
     """
     _setup_logging()
     log = logging.getLogger("duitku.import")
-    log.warning("import stub: no Firefly emitter wired yet (%d file(s))", len(paths))
-    raise typer.Exit(code=1)
+
+    from duitku import parsers
+    from duitku.emitters.firefly import FireflyClient, FireflyConfig, emit
+    from duitku.normalise import normalise, reconcile
+    from duitku.sweep import load_accounts, load_passwords
+
+    passwords = load_passwords(passwords_file)
+    accounts = load_accounts(accounts_file)
+    client = FireflyClient(FireflyConfig.from_env())
+    client.probe()
+
+    exit_code = 0
+    for p in paths:
+        try:
+            statement = parsers.parse(bank, p, passwords=passwords)
+        except Exception:
+            log.exception("parse failed", extra={"file": str(p)})
+            exit_code = 1
+            continue
+        if not reconcile(statement):
+            log.error("reconciliation failed", extra={"file": str(p)})
+            exit_code = 1
+            continue
+        txns = normalise(statement)
+        result = emit(txns, client=client, account_map=accounts)
+        log.info("import done", extra={"file": str(p), **result.summary()})
+        if result.errors > 0:
+            exit_code = 1
+    raise typer.Exit(code=exit_code)
