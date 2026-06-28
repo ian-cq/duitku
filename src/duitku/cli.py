@@ -46,16 +46,6 @@ def serve(
         "--landing-dir",
         help="landing PVC mount path",
     ),
-    hmac_key_file: Path = typer.Option(
-        Path(os.environ.get("DUITKU_HMAC_KEY_FILE", "")),
-        "--hmac-key-file",
-        help="path to file containing the HMAC shared secret (required)",
-    ),
-    max_replay_skew: int = typer.Option(
-        int(os.environ.get("DUITKU_MAX_REPLAY_SKEW", "300")),
-        "--max-replay-skew",
-        help="reject requests with timestamps older than this (seconds)",
-    ),
     max_attachment_size: int = typer.Option(
         int(os.environ.get("DUITKU_MAX_ATTACH_SIZE", str(25 * 1024 * 1024))),
         "--max-attachment-size",
@@ -64,15 +54,15 @@ def serve(
 ) -> None:
     """Run the HTTP webhook receiver.
 
-    HMAC-validates incoming POSTs and writes attachments to the landing
-    directory; nothing here parses or talks to Firefly — that is sweep's
-    job.
+    Authn is enforced at the gateway by Envoy Gateway's ``apiKeyAuth``
+    filter (``X-API-Key`` header). The pod itself does not re-verify
+    the key; it relies on the gateway to drop unauthenticated traffic
+    upstream. The pod still validates bank name, file extension, and
+    attachment size, and writes the file atomically to the landing
+    directory. Nothing here parses or talks to Firefly — that is
+    sweep's job.
     """
     _setup_logging()
-
-    if not str(hmac_key_file):
-        typer.echo("--hmac-key-file (or DUITKU_HMAC_KEY_FILE) is required", err=True)
-        raise typer.Exit(code=2)
 
     # Imported lazily so `duitku --help` doesn't pay the FastAPI import cost.
     import uvicorn
@@ -81,8 +71,6 @@ def serve(
 
     cfg = load_config(
         landing_dir=landing_dir,
-        hmac_key_file=hmac_key_file,
-        max_replay_skew_seconds=max_replay_skew,
         max_attachment_size=max_attachment_size,
     )
     fastapi_app = build_app(cfg)

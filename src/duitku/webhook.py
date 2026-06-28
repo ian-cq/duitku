@@ -1,9 +1,13 @@
 """HTTP receiver invoked by the Cloudflare Email Worker.
 
-The Worker POSTs each extracted attachment to ``/cf-inbox`` with an
-HMAC-SHA256 signature over ``timestamp || "." || body``. This module
-verifies the signature, enforces a tight allowlist on bank names and
-file extensions, and writes the attachment plus a JSON sidecar to the
+The Worker POSTs each extracted attachment to ``/cf-inbox``. Authn is
+handled at the gateway by Envoy Gateway's ``apiKeyAuth`` filter
+(``X-API-Key`` against the in-namespace ``gateway-api-key`` Secret);
+this module does not re-verify it. The pod relies on the gateway to
+drop unauthenticated traffic before it arrives.
+
+The receiver enforces a tight allowlist on bank names and file
+extensions, then writes the attachment plus a JSON sidecar to the
 landing directory.
 
 The receiver deliberately does **not** parse, normalise, or talk to
@@ -17,7 +21,6 @@ asynchronously.
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import logging
 import os
@@ -48,9 +51,6 @@ _BANK_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^[a-z0-9_-]{2,32}$")
 #: 25 MiB matches Gmail's outbound limit.
 DEFAULT_MAX_ATTACHMENT_SIZE: Final[int] = 25 * 1024 * 1024
 
-#: 5 minutes is comfortable given Workers + cluster are both NTP-synced.
-DEFAULT_MAX_REPLAY_SKEW_SECONDS: Final[int] = 5 * 60
-
 
 # ---- config ----------------------------------------------------------
 
@@ -60,56 +60,27 @@ class Config:
     """Webhook handler configuration. Validated by :func:`build_app`."""
 
     landing_dir: Path
-    hmac_key: bytes
-    max_replay_skew_seconds: int = DEFAULT_MAX_REPLAY_SKEW_SECONDS
     max_attachment_size: int = DEFAULT_MAX_ATTACHMENT_SIZE
 
 
 def load_config(
     *,
     landing_dir: str | os.PathLike[str],
-    hmac_key_file: str | os.PathLike[str],
-    max_replay_skew_seconds: int = DEFAULT_MAX_REPLAY_SKEW_SECONDS,
     max_attachment_size: int = DEFAULT_MAX_ATTACHMENT_SIZE,
 ) -> Config:
-    """Read the HMAC key from disk and validate everything at boot.
-
-    A misconfiguration here fails fast instead of producing 500s on
-    every request.
+    """Validate config at boot. A misconfiguration here fails fast
+    instead of producing 500s on every request.
     """
     landing = Path(landing_dir)
     landing.mkdir(parents=True, exist_ok=True)
 
-    key_path = Path(hmac_key_file)
-    key = key_path.read_text(encoding="utf-8").strip()
-    if len(key) < 16:
-        raise ValueError(
-            f"HMAC key in {key_path!s} is too short ({len(key)} chars); want >=16"
-        )
-
     return Config(
         landing_dir=landing,
-        hmac_key=key.encode("utf-8"),
-        max_replay_skew_seconds=max_replay_skew_seconds,
         max_attachment_size=max_attachment_size,
     )
 
 
-# ---- HMAC helpers ----------------------------------------------------
-
-
-def compute_hmac(key: bytes, body: bytes, ts: str) -> str:
-    """Return ``hex(HMAC-SHA256(key, timestamp || "." || body))``.
-
-    Including the timestamp inside the MAC binds the body and the
-    timestamp together so an attacker cannot replay a captured request
-    with a fresh timestamp.
-    """
-    mac = hmac.new(key, digestmod=hashlib.sha256)
-    mac.update(ts.encode("utf-8"))
-    mac.update(b".")
-    mac.update(body)
-    return mac.hexdigest()
+# ---- helpers ---------------------------------------------------------
 
 
 def _sender_domain(sender: str) -> str:
@@ -134,7 +105,7 @@ def build_app(cfg: Config) -> FastAPI:
     - ``GET  /healthz``  — liveness, returns ``200 ok\\n``.
     - ``POST /cf-inbox`` — the Cloudflare Worker endpoint.
     """
-    app = FastAPI(title="duitku-webhook", version="0.2.0", docs_url=None, redoc_url=None)
+    app = FastAPI(title="duitku-webhook", version="0.3.0", docs_url=None, redoc_url=None)
 
     @app.get("/healthz", response_class=Response)
     def healthz() -> Response:
@@ -148,41 +119,18 @@ def build_app(cfg: Config) -> FastAPI:
 
 
 async def _handle_cf_inbox(request: Request, cfg: Config) -> Response:
-    """Validate HMAC + multipart, write attachment + sidecar atomically."""
+    """Parse multipart, write attachment + sidecar atomically.
 
-    # 1. Read raw body up-front so we can HMAC over the exact bytes.
-    #    Starlette caches the result, so a later request.form() call
-    #    re-parses from the same bytes without re-reading the stream.
-    body_limit = cfg.max_attachment_size + (1 << 20)  # + small form overhead
-    raw = await request.body()
-    if len(raw) > body_limit:
-        _bad(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "body too large")
+    Authn is the gateway's job (``X-API-Key``). The optional
+    ``X-Client-Id`` header is injected by EG's
+    ``forwardClientIDHeader`` and is logged for audit only.
+    """
 
-    # 2. Verify timestamp first (cheap), then HMAC.
-    ts_str = request.headers.get("X-Duitku-Timestamp", "")
-    if not ts_str:
-        _bad(status.HTTP_400_BAD_REQUEST, "X-Duitku-Timestamp header missing")
-    try:
-        ts_unix = int(ts_str)
-    except ValueError:
-        _bad(status.HTTP_400_BAD_REQUEST, "X-Duitku-Timestamp not an int")
+    client_id = request.headers.get("X-Client-Id", "")
 
-    drift = abs(time.time() - ts_unix)
-    if drift > cfg.max_replay_skew_seconds:
-        _bad(
-            status.HTTP_401_UNAUTHORIZED,
-            f"timestamp drift {drift:.0f}s exceeds {cfg.max_replay_skew_seconds}s",
-        )
-
-    sig_hdr = request.headers.get("X-Duitku-Signature", "")
-    if not sig_hdr:
-        _bad(status.HTTP_401_UNAUTHORIZED, "X-Duitku-Signature header missing")
-    expected = compute_hmac(cfg.hmac_key, raw, ts_str)
-    provided = sig_hdr.removeprefix("sha256=")
-    if not hmac.compare_digest(expected, provided):
-        _bad(status.HTTP_401_UNAUTHORIZED, "bad signature")
-
-    # 3. HMAC passed. Parse the multipart body.
+    # 1. Parse the multipart body. Starlette's UploadFile spools large
+    #    parts to /tmp via SpooledTemporaryFile, so the request body
+    #    isn't fully in RAM.
     form = await request.form()
 
     bank = str(form.get("bank", "")).lower()
@@ -199,8 +147,9 @@ async def _handle_cf_inbox(request: Request, cfg: Config) -> Response:
             received_at = received_at.replace(tzinfo=timezone.utc)
         received_at = received_at.astimezone(timezone.utc)
     except ValueError:
-        # Fall back to the verified header timestamp.
-        received_at = datetime.fromtimestamp(ts_unix, tz=timezone.utc)
+        # Fall back to current UTC time if the form field is missing
+        # or unparseable.
+        received_at = datetime.now(tz=timezone.utc)
 
     message_id = str(form.get("message_id", ""))
     sender = str(form.get("sender", ""))
@@ -210,7 +159,7 @@ async def _handle_cf_inbox(request: Request, cfg: Config) -> Response:
     if not isinstance(upload, UploadFile):
         _bad(status.HTTP_400_BAD_REQUEST, "file form field missing")
 
-    # 4. Read attachment into memory once so we can hash it. The form
+    # 2. Read attachment into memory once so we can hash it. The form
     #    parser respects MAX_FILE_SIZE on UploadFile via Starlette's
     #    spooled tempfile, but we still cap explicitly.
     buf = await upload.read(cfg.max_attachment_size + 1)
@@ -230,7 +179,7 @@ async def _handle_cf_inbox(request: Request, cfg: Config) -> Response:
 
     digest = hashlib.sha256(buf).hexdigest()
 
-    # 5. Final on-disk path: /landing/{bank}/inbox/{UTC-ts}-{digest[:16]}{ext}
+    # 3. Final on-disk path: /landing/{bank}/inbox/{UTC-ts}-{digest[:16]}{ext}
     inbox_dir = cfg.landing_dir / bank / "inbox"
     inbox_dir.mkdir(parents=True, exist_ok=True)
     filename = f"{received_at.strftime('%Y%m%dT%H%M%SZ')}-{digest[:16]}{ext}"
@@ -240,11 +189,16 @@ async def _handle_cf_inbox(request: Request, cfg: Config) -> Response:
     if final_path.exists():
         log.info(
             "attachment already present, skip write",
-            extra={"bank": bank, "sha256": digest, "path": str(final_path)},
+            extra={
+                "bank": bank,
+                "sha256": digest,
+                "path": str(final_path),
+                "client_id": client_id,
+            },
         )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    # 6. Tempfile + rename for crash safety.
+    # 4. Tempfile + rename for crash safety.
     fd, tmp_path_str = tempfile.mkstemp(prefix=".tmp-", dir=str(inbox_dir))
     tmp_path = Path(tmp_path_str)
     try:
@@ -262,7 +216,7 @@ async def _handle_cf_inbox(request: Request, cfg: Config) -> Response:
         log.exception("write attachment failed", extra={"bank": bank, "sha256": digest})
         raise
 
-    # 7. Sidecar metadata. Non-fatal if it fails; the attachment is saved.
+    # 5. Sidecar metadata. Non-fatal if it fails; the attachment is saved.
     meta = {
         "bank": bank,
         "received_at": received_at.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
@@ -271,6 +225,7 @@ async def _handle_cf_inbox(request: Request, cfg: Config) -> Response:
         "attachment_filename": declared_name,
         "sha256": digest,
         "bytes": len(buf),
+        "client_id": client_id,
     }
     meta_path = final_path.with_suffix(final_path.suffix + ".meta.json")
     try:
@@ -288,6 +243,7 @@ async def _handle_cf_inbox(request: Request, cfg: Config) -> Response:
             "path": str(final_path),
             "message_id": message_id,
             "sender_domain": _sender_domain(sender),
+            "client_id": client_id,
         },
     )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
