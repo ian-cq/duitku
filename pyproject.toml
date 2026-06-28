@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "duitku"
+version = "0.2.0"
+description = "Malaysian bank-statement parser and Firefly III importer"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Chan Quan Ian", email = "work@quanianitis.com" }]
+dependencies = [
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.34.0",
+    "python-multipart==0.0.20",
+    "typer==0.15.1",
+    "pyyaml==6.0.2",
+]
+
+[project.optional-dependencies]
+# Parsers are an opt-in install. The webhook image does not need them;
+# the sweep/parse worker image (phase 1) will install duitku[parsers].
+# Kept separate so the receiver pod stays slim and so version churn in
+# pdfplumber/pikepdf doesn't force a webhook redeploy.
+parsers = [
+    "pdfplumber==0.11.4",
+    "pikepdf==9.4.2",
+]
+dev = [
+    "pytest==8.3.4",
+    "httpx==0.28.1",  # FastAPI TestClient transport
+    "pytest-asyncio==0.25.0",
+]
+
+[project.scripts]
+duitku = "duitku.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

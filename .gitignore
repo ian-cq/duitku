@@ -1,9 +1,18 @@
-# Binaries and build artefacts
-/duitku
+# Build / dist
 /dist/
-*.exe
-*.test
-*.out
+/build/
+*.egg-info/
+.eggs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # OS / editor
 .DS_Store
