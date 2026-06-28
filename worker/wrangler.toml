@@ -17,7 +17,7 @@
 # is configured in the Cloudflare dashboard, not here. wrangler does
 # not yet manage routing rules declaratively.
 
-name = "duitku-email-worker"
+name = "smtp-bank-duitku-worker"
 main = "src/index.ts"
 compatibility_date = "2026-01-15"
 compatibility_flags = ["nodejs_compat"]
@@ -30,7 +30,7 @@ workers_dev = false
 [vars]
 # Public, non-secret config. The webhook URL is fixed for the homelab
 # and changing it is a coordinated DNS/Gateway/Worker change anyway.
-WEBHOOK_URL = "https://duitku-inbox.62a.quanianitis.com/cf-inbox"
+WEBHOOK_URL = "https://inbox.62a.quanianitis.com/cf-inbox"
 
 # Comma-separated SMTP envelope-from addresses or sender domains
 # allowed to invoke the pipeline. Defence in depth on top of the
@@ -39,8 +39,24 @@ WEBHOOK_URL = "https://duitku-inbox.62a.quanianitis.com/cf-inbox"
 #
 # Edit and `wrangler deploy` to add a new bank or a new forwarding
 # address.
-SENDER_ALLOWLIST = "maybank2u.com.my,maybank.com.my,uob.com.my,uob.com.sg,ryt.com.my,rytbank.com.my,quanianitis@gmail.com,work@quanianitis.com,main@quanianitis.com"
+SENDER_ALLOWLIST = "maybank2u.com.my,maybank.com.my,uob.com.my,uob.com.sg,ryt.com.my,rytbank.my,quanianitis@gmail.com,work@quanianitis.com,main@quanianitis.com"
 
 # Max single attachment size in bytes (25 MiB; matches Gmail's
 # outbound cap and the receiver's hard limit).
 MAX_ATTACHMENT_BYTES = "26214400"
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
+
